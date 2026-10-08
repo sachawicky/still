@@ -217,7 +217,10 @@ do {
     print("SleepDisabled at test time: \(flag.map(String.init(describing:)) ?? "unreadable")")
     check(flag == nil || flag == true || flag == false, "flag readable as tri-state")
     print("privilege granted: \(controller.privilegeGranted)")
-    check(controller.privilegeGranted, "privilege detected via sudo listing (requires installed rule)")
+    // Needs Still's sudoers rule on this machine; not meaningful on CI runners.
+    if ProcessInfo.processInfo.environment["CI"] == nil {
+        check(controller.privilegeGranted, "privilege detected via sudo listing (requires installed rule)")
+    }
 }
 
 // MARK: - Detection snapshot
