@@ -13,13 +13,15 @@ jobs:
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
-      - name: Select validated Xcode
+      - name: Select supported Xcode
         run: |
           if [ -d /Applications/Xcode_27.0.app ]; then
             sudo xcode-select -s /Applications/Xcode_27.0.app/Contents/Developer
           fi
           xcodebuild -version
-          xcodebuild -version | grep -q '^Xcode 27' || { echo 'Xcode 27 is required for native icon compilation'; exit 1; }
+          # Hosted macOS 26 images may lag the locally validated Xcode 27.
+          # Xcode 26 also supplies Swift 6.2+, the macOS 26 SDK and actool.
+          xcodebuild -version | grep -Eq '^Xcode (26|27)(\.|$)' || { echo 'Xcode 26 or 27 is required'; exit 1; }
           swift --version
       - name: Tests
         run: swift run StillCheck
