@@ -10,10 +10,12 @@ Thanks for your interest in Still. Bug reports, fixes and small improvements are
 
 ## Setup
 
-Requires macOS 26 and Xcode 26 (Swift 6.2).
+Requires macOS 26 or later and Xcode 27 (Swift 6.2 or later), including Icon Composer and actool.
 
 ```bash
+swift test
 swift run StillCheck          # must report 0 failures
+python3 -B Scripts/test-focus-hooks.py
 ./Scripts/build-release.sh    # builds and audits dist/Still.app
 ```
 

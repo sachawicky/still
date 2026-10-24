@@ -1,45 +1,35 @@
-# Releasing
+# Still 2.0.0 RC 2 — build 7 release process
 
-Identity (name, bundle id `app.still.macos`, version, build, minimum macOS) lives in `Support/version.env`.
+Identity: app.still.macos, version 2.0.0, build 7, channel rc.2. macOS 26+, Apple silicon only. Xcode 27 is the validated toolchain. Support/version.env is the release identity source; build-release.sh applies it to the bundle. Support/Info.plist carries matching defaults. No universal binary is claimed. Build outputs depend on the SDK/toolchain; reproducible procedure does not imply bit-identical signatures or timestamps.
 
-## Checks
+## Validation and local installation
 
-```bash
-swift run StillCheck            # expect: 146 passed, 0 failed
-./Scripts/build-release.sh      # builds dist/Still.app and audits it with Scripts/verify-release.sh
+```
+swift test
+swift run StillCheck
+python3 Scripts/test-focus-hooks.py
+Scripts/review-design.sh --verify-ambient
+Scripts/review-design.sh --verify-focus-lifecycle
+Scripts/build-release.sh
+Scripts/verify-release.sh dist/Still.app
 ```
 
-## Signed and notarized release
+Install locally only when an application replacement is intended, using `Scripts/install-local.sh`. See [build 7 checks and remaining device validation](Docs/RELEASE-CANDIDATE.md).
 
-Requires a Developer ID Application certificate and notarization credentials. An ad-hoc build must never be published as a release.
+Builds compile the native Icon Composer source using actool (including fallback ICNS), embed the privacy disclosure and license, strip local symbols and sign with Hardened Runtime. Default signing is ad-hoc. Existing preferences and agent configuration are preserved. New installations start with streaming/agent/playback automation off, a finite session timeout, notification opt-in and no login item. Explicit settings from 1.2 remain intact. The installer validates staging before quitting, verifies launch and retains the previous bundle under .build/install-backups. Failed upgrades restore the old bundle when available.
 
-```bash
-SIGN_IDENTITY="Developer ID Application: Name (TEAMID)" ./Scripts/build-release.sh
-ditto -c -k --keepParent dist/Still.app dist/Still-1.0.0-macOS.zip
-xcrun notarytool submit dist/Still-1.0.0-macOS.zip --keychain-profile <profile> --wait
-xcrun stapler staple dist/Still.app
-rm dist/Still-1.0.0-macOS.zip
-ditto -c -k --keepParent dist/Still.app dist/Still-1.0.0-macOS.zip
-shasum -a 256 dist/Still-1.0.0-macOS.zip > dist/Still-1.0.0-macOS.zip.sha256
-spctl --assess --type execute -vv dist/Still.app
-```
+## Public direct distribution — requires maintainer approval
 
-Then tag and publish:
+Read Docs/DISTRIBUTION-AUDIT.md first. No Store build is supported. A valid Developer ID Application certificate and private key must exist in the keychain; never add credentials to the repository. Rebuild with an explicit SIGN_IDENTITY environment variable. The script adds a secure timestamp for that identity. Inspect actual signature authority, TeamIdentifier, entitlements and runtime flags.
 
-```bash
-git tag v1.0.0 && git push origin v1.0.0
-gh release create v1.0.0 dist/Still-1.0.0-macOS.zip dist/Still-1.0.0-macOS.zip.sha256 --title "Still 1.0.0" --notes-file <notes>
-```
+Only after explicit approval to upload, the maintainer can create a submission ZIP and submit it with `xcrun notarytool submit` using a previously configured keychain profile. Wait for Accepted, inspect the log, staple using `xcrun stapler staple dist/Still.app`, and validate the ticket. Do not weaken Gatekeeper or remove quarantine to obtain a passing result. `Scripts/package-direct.sh` refuses ad-hoc, unstapled or Gatekeeper-rejected bundles and only creates a local ZIP/checksum; it does not upload or publish.
 
-Update the Download section of the README at the same time.
+Source commits and pushes, binary releases, Apple notarization submissions and Store submissions are separate actions. The build 7 source publication does not authorize binary uploads or notarization. No workflow publishes installers automatically. No credentials or signing profiles are stored in CI. Local unsigned CI artifacts must not be advertised as public installers.
 
-## Local install (maintainer)
+## Update and failure behavior
 
-`./Scripts/install-local.sh` builds, quits the running Still and replaces `/Applications/Still.app`.
+Updates are manual replacements from the verified distribution source. No remote code, updater feed or automatic download is present. A later updater needs signature continuity, authenticated metadata and rollback review. End sessions and quit cleanly before replacing. macOS DiagnosticReports provides crash reporting; Metal failures log via os.Logger and fall back to static gradients. Current sessions use process-owned idle-sleep assertions, released by macOS on process death and bounded by a three-hour kernel timeout. They never enable the global sleep flag. Failed recovery of a Still-owned legacy flag retains a visible warning and its ownership marker. Sleep, lock and session interruptions end Focus and require explicit resume. See Docs/POWER-SAFETY.md for external-display handling and macOS limitations.
 
-## Known limitations
+## Required human/device release checks
 
-- Apple silicon and macOS 26 only.
-- Safari resume depends on Safari producing local audio. AirPlay video that bypasses the Mac is not detected, so nothing is sent.
-- AI Work uses transcript activity. A tool call silent for over 3 minutes may let the Mac sleep.
-- `pmset disablesleep` is undocumented and may change in future macOS versions.
+Fresh Mac: consent dialogs, cancel/retry, no session before an explicit action/opt-in, Accessibility and notification revocation, Launch at Login approval, reboot and uninstall. Upgrade from a real 1.2 install: preserve defaults, stable identity and reconciliation; changed ad-hoc signatures may require TCC approval again. Physically close/open the lid, disconnect each external display, sleep/wake, switch power sources and sustain a workload long enough for thermal pressure. Exercise VoiceOver and Full Keyboard Access with system contrast/transparency preferences. No synthetic test substitutes for these checks or App Store acceptance.

@@ -21,16 +21,21 @@ public final class AppModel: ObservableObject {
     @Published public private(set) var batteryPercent = -1
     @Published public private(set) var onBattery = false
     @Published public private(set) var lidClosed = false
+    @Published public private(set) var externalDisplayConnected = false
+    @Published public private(set) var powerLifecycle = PowerLifecycle()
     @Published public private(set) var privilegeGranted = false
     @Published public private(set) var flagWarning: FlagWarning?
     @Published public private(set) var loginItemEnabled = false
     @Published public private(set) var loginItemNeedsApproval = false
     @Published public private(set) var loginItemNote: String?
     @Published public private(set) var setupInFlight = false
+    @Published public private(set) var setupNote: String?
     @Published public private(set) var agent: CodingAgent?
     @Published public private(set) var streamActive = false
     @Published public private(set) var resumeNeedsPermission = false
     @Published public var showSettings = false
+    @Published public var showWelcome = false
+    @Published public private(set) var actionNote: String?
 
     @Published public var aiDetectEnabled: Bool {
         didSet {
@@ -69,6 +74,9 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    public let appearance = AppearanceController()
+    public let focus: FocusController
+
     private var policy: SessionPolicy
     private let sleepController = SleepController()
     private let detection = DetectionCenter()
@@ -80,8 +88,16 @@ public final class AppModel: ObservableObject {
     private var resumeTimer: Timer?
     private var resumeLogic = PlaybackResumeLogic()
     private var wasHolding = false
+    private var powerObservers: [NSObjectProtocol] = []
+    private var lockObserver: NSObjectProtocol?
+    private var assertionHealthy = true
 
     public var phase: SessionPhase { decision.phase }
+    public var effectiveBatteryFloor: Int { max(15, batteryFloor) }
+
+    private func safeDeadline() -> Date {
+        Date().addingTimeInterval(min(safetyTimeout.interval ?? 3 * 3600, 3 * 3600))
+    }
 
     /// True whenever a session is wanted or still being unwound.
     public var holdSwitchOn: Bool {
@@ -89,23 +105,21 @@ public final class AppModel: ObservableObject {
     }
 
     public init() {
-        let autoDetect = defaults.object(forKey: "autoDetectEnabled") as? Bool ?? true
+        PreferenceMigration.migrate(defaults)
+        focus = FocusController(appearance: appearance)
+        appearance.useForApplication()
+        showWelcome = !defaults.bool(forKey: "stillWelcome.v2")
+        let autoDetect = defaults.object(forKey: "autoDetectEnabled") as? Bool ?? false
         let floor = defaults.object(forKey: "batteryFloor") as? Int ?? 15
         autoDetectEnabled = autoDetect
-        aiDetectEnabled = defaults.object(forKey: "aiDetectEnabled") as? Bool ?? true
-        resumePlaybackEnabled = defaults.object(forKey: "resumePlaybackEnabled") as? Bool ?? true
+        aiDetectEnabled = defaults.object(forKey: "aiDetectEnabled") as? Bool ?? false
+        resumePlaybackEnabled = defaults.object(forKey: "resumePlaybackEnabled") as? Bool ?? false
         safetyTimeout = SafetyTimeout(rawValue: defaults.object(forKey: "safetyTimeout") as? Int ?? SafetyTimeout.default.rawValue) ?? .default
         batteryFloor = floor
-        showMenuBarWordmark = defaults.object(forKey: "showMenuBarWordmark") as? Bool ?? true
+        showMenuBarWordmark = defaults.object(forKey: "showMenuBarWordmark") as? Bool ?? false
 
-        // Restore a manual session only if its Safety Timeout has not passed.
-        var restored = SessionState()
-        if defaults.bool(forKey: "manualArmed") {
-            let stored = defaults.object(forKey: "manualDeadline") as? Date
-            if stored == nil || stored! > Date() {
-                restored = SessionState(manualArmed: true, manualDeadline: stored)
-            }
-        }
+        // A restarted process must never resurrect an old manual awake session.
+        let restored = SessionState()
         policy = SessionPolicy(state: restored)
         Self.persist(restored, in: defaults)
 
@@ -137,9 +151,15 @@ public final class AppModel: ObservableObject {
         }
 
         reconcileOnLaunch()
+        observePowerLifecycle()
         repairLoginItemLocation()
         refreshLoginItem()
+        focus.onAutoActivate = { [weak self] in self?.startFocus(userInitiated: false) }
         evaluate()
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.showWelcome else { return }
+            WelcomeWindow.show(appearance: self.appearance) { [weak self] in self?.completeWelcome() }
+        }
         log.info("started (privilege=\(self.privilegeGranted, privacy: .public))")
 
         let timer = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
@@ -153,9 +173,16 @@ public final class AppModel: ObservableObject {
 
     // MARK: - User actions
 
+    public func completeWelcome() {
+        defaults.set(true, forKey: "stillWelcome.v2")
+        showWelcome = false
+    }
+
     public func setManualArmed(_ armed: Bool) {
+        actionNote = nil
+        if armed { powerLifecycle.resumeByUser(); assertionHealthy = true }
         let snapshot = detection.snapshot()
-        let deadline = armed ? safetyTimeout.deadline(from: Date()) : nil
+        let deadline = armed ? safeDeadline() : nil
         policy.setManualArmed(armed, streamActive: snapshot.streamActive, agentActive: snapshot.agentActive, deadline: deadline)
         Self.persist(policy.state, in: defaults)
         if armed { Notifier.requestAuthorizationIfNeeded() }
@@ -171,66 +198,77 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    public func sleepNow() {
-        setManualArmed(false)
-        if appliedHold, !sleepController.writeSleepDisabled(false) {
-            log.error("sleepNow: could not release SleepDisabled")
+    /// Focus uses the same policy and guards as every existing session. A newly
+    /// requested Focus hold is always finite, even if the manual picker says unlimited.
+    public func startFocus() {
+        startFocus(userInitiated: true)
+    }
+
+    private func startFocus(userInitiated: Bool) {
+        guard !focus.settings.guiAutomation else { return }
+        if userInitiated {
+            powerLifecycle.resumeByUser()
+            assertionHealthy = true
+        }
+        guard powerLifecycle.allowsHold else { return }
+        guard focus.canStart else { focus.start(); return }
+        if DetectionCenter.hasExternalDisplay() {
+            evaluate()
+            focus.start()
             return
         }
-        if appliedHold {
-            appliedHold = false
-            assertion.setActive(false, reason: "")
-            restoring = false
+        if !decision.holdAwake {
+            let snapshot = detection.snapshot()
+            policy.setManualArmed(true, streamActive: snapshot.streamActive, agentActive: snapshot.agentActive,
+                                  deadline: safeDeadline())
+            Self.persist(policy.state, in: defaults)
+            evaluate()
         }
+        guard decision.holdAwake, appliedHold else {
+            focus.pause(reason: "Still cannot keep your Mac active. Check its session status and safety settings.")
+            return
+        }
+        focus.start()
+    }
+
+    public func sleepNow() {
+        interruptPower(.sleepRequested)
+        guard !restoring else { return }
         requestSystemSleep()
     }
 
     private func requestSystemSleep() {
         let result = ProcessRunner.run("/usr/bin/pmset", ["sleepnow"], timeout: 5)
-        if result.exitCode <= 0 { return }
+        if result.exitCode == 0 { return }
         log.info("pmset sleepnow failed, falling back to System Events")
         var error: NSDictionary?
         NSAppleScript(source: #"tell application "System Events" to sleep"#)?
             .executeAndReturnError(&error)
         if let error {
+            actionNote = "macOS could not start sleep. End the session and use the Apple menu to sleep."
             log.error("sleep request failed: \(error)")
         }
     }
 
     public func beginSetup() {
-        guard !setupInFlight, !privilegeGranted else { return }
+        // Only recover an owned legacy setting. New sessions need no privilege.
+        guard sleepController.didSetFlag else { return }
         setupInFlight = true
-        let granted = sleepController.installPrivilege()
+        let restored = sleepController.restoreLegacyWithAuthorization()
         setupInFlight = false
-        if granted {
-            privilegeGranted = true
-            reconcileOnLaunch()
-            evaluate()
-        }
-    }
-
-    public func restoreNormalSleep() {
-        guard sleepController.writeSleepDisabled(false) else {
-            if !privilegeGranted { beginSetup() }
-            return
-        }
-        appliedHold = false
-        assertion.setActive(false, reason: "")
-        flagWarning = nil
-        sleepController.didSetFlag = false
+        setupNote = restored ? nil : "Normal sleep could not be restored. Approve the one-time recovery and retry."
+        retryLegacyRestoration()
         evaluate()
     }
 
+    public func restoreNormalSleep() {
+        interruptPower(.sleepRequested)
+    }
+
     public func removeAccess() {
-        // Never remove the privilege while our own hold could still be in place:
-        // without it the flag could not be cleared afterwards.
-        let ownsFlag = sleepController.readSleepDisabled() == true && sleepController.didSetFlag
-        if appliedHold || ownsFlag {
-            guard sleepController.writeSleepDisabled(false) else { return }
-            appliedHold = false
-            assertion.setActive(false, reason: "")
-            restoring = false
-        }
+        // Do not remove the old permission before its owned global flag is clear.
+        retryLegacyRestoration()
+        guard !sleepController.didSetFlag else { return }
         sleepController.removePrivilege()
         privilegeGranted = sleepController.privilegeGranted
         evaluate()
@@ -283,6 +321,7 @@ public final class AppModel: ObservableObject {
 
     /// Re-reads permissions the user may have changed in System Settings.
     public func refreshPermissions() {
+        privilegeGranted = sleepController.privilegeGranted
         resumeNeedsPermission = resumePlaybackEnabled && !MediaKey.hasPermission
     }
 
@@ -294,6 +333,7 @@ public final class AppModel: ObservableObject {
         batteryPercent = snapshot.batteryPercent
         onBattery = snapshot.onBattery
         lidClosed = snapshot.lidClosed
+        externalDisplayConnected = snapshot.externalDisplayConnected
         agent = snapshot.agent
         streamActive = snapshot.streamActive
 
@@ -302,15 +342,17 @@ public final class AppModel: ObservableObject {
             manualArmed: policy.state.manualArmed,
             autoDetectEnabled: autoDetectEnabled,
             streamActive: snapshot.streamActive,
-            batteryPercent: snapshot.batteryPercent < 0 ? 100 : snapshot.batteryPercent,
+            batteryPercent: snapshot.batteryPercent < 0 ? 0 : snapshot.batteryPercent,
             onBattery: snapshot.onBattery,
             thermalNominalOrFair: snapshot.thermalNominalOrFair,
             lowPowerMode: snapshot.lowPowerMode,
-            batteryFloor: batteryFloor,
-            privilegeGranted: privilegeGranted,
-            lastWriteSucceeded: sleepController.lastWriteSucceeded,
+            batteryFloor: effectiveBatteryFloor,
+            privilegeGranted: true, // native assertions require no administrator access
+            lastWriteSucceeded: assertionHealthy && !restoring,
             aiDetectEnabled: aiDetectEnabled,
-            agentActive: snapshot.agentActive
+            agentActive: snapshot.agentActive,
+            systemAllowsHold: powerLifecycle.allowsHold,
+            externalDisplayConnected: snapshot.externalDisplayConnected
         )
 
         decision = policy.step(input)
@@ -322,8 +364,10 @@ public final class AppModel: ObservableObject {
             )
         }
         apply(decision)
-        if decision.holdAwake {
-            flagWarning = nil
+        focus.updatePower(onBattery: onBattery)
+        focus.updateActivity(agent)
+        if focus.active && !externalDisplayConnected && (!decision.holdAwake || !appliedHold) {
+            focus.pause(reason: "Focus ended with Still’s awake session. Check its status before restarting.")
         }
         scheduleDeadlineTimer()
         updateResumeMonitoring(snapshotStream: snapshot.streamActive)
@@ -397,106 +441,109 @@ public final class AppModel: ObservableObject {
     }
 
     private func apply(_ decision: SessionDecision) {
-        if decision.holdAwake {
-            guard privilegeGranted else { return }
-            if !appliedHold {
-                let ok = sleepController.writeSleepDisabled(true)
-                appliedHold = ok
-                assertion.setActive(ok, reason: "\(Brand.name): keeping the Mac active for a running session")
-                if !ok {
-                    log.error("failed to enable SleepDisabled")
-                }
-            }
-        } else if appliedHold {
-            let ok = sleepController.writeSleepDisabled(false)
-            if ok {
-                appliedHold = false
-                assertion.setActive(false, reason: "")
-                if sleepController.lastWriteSucceeded {
-                    restoring = false
-                }
-            } else {
-                restoring = true
-            }
-        } else {
-            restoring = false
-        }
+        let wanted = decision.holdAwake && powerLifecycle.allowsHold && !externalDisplayConnected && !restoring
+        let ok = assertion.setActive(wanted, reason: "Still: awake session; explicit sleep always allowed")
+        appliedHold = assertion.isActive
+        assertionHealthy = assertionHealthy && ok
+        if !ok { actionNote = "Still could not update its awake assertion. End the session and try again." }
     }
 
     // MARK: - Reconciliation
 
     private func reconcileOnLaunch() {
+        retryLegacyRestoration()
+    }
+
+    private func retryLegacyRestoration() {
         let flag = sleepController.readSleepDisabled()
-        let action = ReconcileLogic.launchAction(
-            flag: flag,
-            didSetFlag: sleepController.didSetFlag,
-            privileged: privilegeGranted
-        )
-        switch action {
-        case .clearFlag:
-            if sleepController.writeSleepDisabled(false) {
-                appliedHold = false
-            }
-        case .clearOwnership:
-            sleepController.didSetFlag = false
-        case .warnExternal:
-            flagWarning = .external
-        case .warnNoPrivilege:
-            if flag == true {
-                flagWarning = sleepController.didSetFlag ? .staleNoPrivilege : .external
-            } else {
+        if sleepController.didSetFlag {
+            if flag == false {
                 sleepController.didSetFlag = false
+                restoring = false
+                flagWarning = nil
+            } else {
+                restoring = !sleepController.writeSleepDisabled(false)
+                flagWarning = restoring ? .staleNoPrivilege : nil
             }
-        case .none:
-            break
+        } else {
+            restoring = false
+            flagWarning = flag == true ? .external : nil
         }
-        if flag == true, appliedHold == false, sleepController.didSetFlag == false, flagWarning == nil {
-            flagWarning = .external
+    }
+
+    private func observePowerLifecycle() {
+        let center = NSWorkspace.shared.notificationCenter
+        let events: [(Notification.Name, PowerLifecycle.Event)] = [
+            (NSWorkspace.willSleepNotification, .willSleep),
+            (NSWorkspace.sessionDidResignActiveNotification, .sessionInactive),
+            (NSWorkspace.willPowerOffNotification, .terminate),
+            // Conservative public fallback for lock detection: display sleep
+            // also ends the session; it is never interpreted as an immediate
+            // request to put the machine to sleep.
+            (NSWorkspace.screensDidSleepNotification, .sessionInactive)
+        ]
+        for (name, event) in events {
+            powerObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.interruptPower(event) }
+            })
         }
+        powerObservers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.interruptPower(.didWake) }
+        })
+        for name in [NSWorkspace.sessionDidBecomeActiveNotification, NSWorkspace.screensDidWakeNotification] {
+            powerObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.powerLifecycle.sessionBecameActive()
+                    self?.evaluate()
+                }
+            })
+        }
+        // macOS emits this distributed notification on lock, but does not
+        // document it as a public contract. It supplements the public session
+        // and display-sleep paths above; never use it to intercept Apple Sleep.
+        lockObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("com.apple.screenIsLocked"), object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.interruptPower(.lock) }
+        }
+    }
+
+    private func interruptPower(_ event: PowerLifecycle.Event) {
+        powerLifecycle.receive(event) // latch BEFORE releasing any resources
+        _ = assertion.setActive(false, reason: "")
+        appliedHold = assertion.isActive
+        focus.stop()
+        resumeTimer?.invalidate()
+        resumeTimer = nil
+        resumeLogic.reset()
+        policy = SessionPolicy() // discard automatic trackers and grace windows
+        Self.persist(policy.state, in: defaults)
+        retryLegacyRestoration()
+        evaluate()
+    }
+
+    isolated deinit {
+        verifyTimer?.invalidate()
+        deadlineTimer?.invalidate()
+        resumeTimer?.invalidate()
+        for observer in powerObservers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        if let lockObserver { DistributedNotificationCenter.default().removeObserver(lockObserver) }
     }
 
     private func verifyTick() {
+        retryLegacyRestoration()
+        refreshPermissions()
         evaluate()
-        let flag = sleepController.readSleepDisabled()
-
-        if decision.holdAwake {
-            flagWarning = nil
-            if flag == false, privilegeGranted {
-                let ok = sleepController.writeSleepDisabled(true)
-                appliedHold = ok
-                assertion.setActive(ok, reason: "\(Brand.name): keeping the Mac active for a running session")
-                if ok {
-                    log.info("re-asserted SleepDisabled after external clear")
-                }
-            }
-            return
-        }
-
-        if flag == true, sleepController.didSetFlag, privilegeGranted {
-            if sleepController.writeSleepDisabled(false) {
-                appliedHold = false
-                assertion.setActive(false, reason: "")
-                restoring = false
-            } else {
-                restoring = true
-            }
-        } else if flag == true, !sleepController.didSetFlag, flagWarning == nil {
-            flagWarning = .external
-        }
     }
 
     private func shutdown() {
+        interruptPower(.terminate)
         verifyTimer?.invalidate()
         deadlineTimer?.invalidate()
         resumeTimer?.invalidate()
         policy.setManualArmed(false, streamActive: false)
         Self.persist(policy.state, in: defaults)
-        if appliedHold {
-            _ = sleepController.writeSleepDisabled(false)
-            appliedHold = false
-        }
-        assertion.setActive(false, reason: "")
-        log.info("shutdown complete, SleepDisabled released")
+        log.info("shutdown complete; owned resources released or restoration warning retained")
     }
 
     // MARK: - Smoke mode (read-only diagnostics)

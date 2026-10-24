@@ -6,6 +6,8 @@ public enum SuspendReason: String, Sendable, Equatable {
     case lowPower
     case setup
     case error
+    case system
+    case externalDisplay
 }
 
 public enum SessionPhase: Sendable, Equatable {
@@ -67,6 +69,8 @@ public struct SessionInput: Sendable, Equatable {
     public var lastWriteSucceeded: Bool
     public var aiDetectEnabled: Bool
     public var agentActive: Bool
+    public var systemAllowsHold: Bool
+    public var externalDisplayConnected: Bool
 
     public init(
         now: Date,
@@ -81,7 +85,9 @@ public struct SessionInput: Sendable, Equatable {
         privilegeGranted: Bool,
         lastWriteSucceeded: Bool,
         aiDetectEnabled: Bool = false,
-        agentActive: Bool = false
+        agentActive: Bool = false,
+        systemAllowsHold: Bool = true,
+        externalDisplayConnected: Bool = false
     ) {
         self.now = now
         self.manualArmed = manualArmed
@@ -96,6 +102,8 @@ public struct SessionInput: Sendable, Equatable {
         self.lastWriteSucceeded = lastWriteSucceeded
         self.aiDetectEnabled = aiDetectEnabled
         self.agentActive = agentActive
+        self.systemAllowsHold = systemAllowsHold
+        self.externalDisplayConnected = externalDisplayConnected
     }
 }
 
@@ -201,7 +209,7 @@ public struct SessionPolicy: Sendable, Equatable {
     public init(
         state: SessionState = SessionState(),
         graceInterval: TimeInterval = 15,
-        autoCeiling: TimeInterval = 8 * 3600
+        autoCeiling: TimeInterval = 3 * 3600
     ) {
         self.state = state
         self.graceInterval = graceInterval
@@ -271,6 +279,8 @@ public struct SessionPolicy: Sendable, Equatable {
                 inGrace: false, expired: expired
             )
         }
+        if !input.systemAllowsHold { return decision(.suspended(.system), hold: false) }
+        if input.externalDisplayConnected { return decision(.suspended(.externalDisplay), hold: false) }
         if !input.privilegeGranted { return decision(.suspended(.setup), hold: false) }
         if !input.lastWriteSucceeded { return decision(.suspended(.error), hold: false) }
         if input.lowPowerMode { return decision(.suspended(.lowPower), hold: false) }
@@ -292,7 +302,7 @@ public enum LaunchAction: String, Sendable, Equatable {
 
 public enum ReconcileLogic {
     public static func launchAction(flag: Bool?, didSetFlag: Bool, privileged: Bool) -> LaunchAction {
-        guard let flag else { return didSetFlag ? .clearOwnership : .none }
+        guard let flag else { return didSetFlag ? (privileged ? .clearFlag : .warnNoPrivilege) : .none }
         if flag {
             if didSetFlag {
                 return privileged ? .clearFlag : .warnNoPrivilege
@@ -309,7 +319,6 @@ public enum ReconcileLogic {
         privileged: Bool
     ) -> ReconcileAction? {
         guard let flag else { return nil }
-        if holdDesired, !flag, privileged { return .setFlag(true) }
         if !holdDesired, flag, didSetFlag, privileged { return .setFlag(false) }
         return nil
     }

@@ -17,10 +17,23 @@ APP="$DIST/$APP_NAME.app"
 ENTITLEMENTS="Entitlements/$APP_NAME.entitlements"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
+if [ "${REQUIRE_DEVELOPER_ID:-0}" = 1 ] && [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "Developer ID signing is required; set SIGN_IDENTITY explicitly." >&2; exit 1
+fi
+if [ "$SIGN_IDENTITY" != "-" ]; then
+    case "$SIGN_IDENTITY" in
+        'Developer ID Application: '*) ;;
+        *) echo "Use a Developer ID Application identity for direct distribution." >&2; exit 1 ;;
+    esac
+    security find-identity -v -p codesigning | grep -F "\"$SIGN_IDENTITY\"" >/dev/null || {
+        echo "Requested Developer ID identity is not available in the keychain." >&2; exit 1;
+    }
+fi
+
 echo "==> $APP_NAME $VERSION ($BUILD)"
 
 echo "==> swift build -c release (optimized)"
-swift build -c release
+swift build -c release -Xswiftc -debug-prefix-map -Xswiftc "$ROOT=."
 BIN_DIR="$(swift build -c release --show-bin-path)"
 BIN="$BIN_DIR/$APP_NAME"
 [ -x "$BIN" ] || { echo "missing binary: $BIN" >&2; exit 1; }
@@ -45,10 +58,18 @@ PB=/usr/libexec/PlistBuddy
 "$PB" -c "Set :LSMinimumSystemVersion $MIN_MACOS" "$PLIST"
 plutil -lint "$PLIST" >/dev/null
 
-echo "==> app icon"
-ICONSET="$(mktemp -d)/AppIcon.iconset"
-"$APP/Contents/MacOS/$APP_NAME" --render-iconset "$ICONSET"
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+echo "==> native Icon Composer assets"
+TEMP_ASSETS="$(mktemp -d)"
+trap 'rm -rf "$TEMP_ASSETS"' EXIT
+xcrun actool Art/Icons/Still.icon --compile "$APP/Contents/Resources" \
+    --output-partial-info-plist "$TEMP_ASSETS/icon-info.plist" --app-icon Still \
+    --enable-icon-stack-fallback-generation YES --platform macosx \
+    --minimum-deployment-target "$MIN_MACOS" --target-device mac --output-format human-readable-text
+"$PB" -c "Set :CFBundleIconFile Still" "$PLIST"
+"$PB" -c "Set :StillReleaseChannel $RELEASE_CHANNEL" "$PLIST"
+cp Support/PrivacyInfo.xcprivacy "$APP/Contents/Resources/"
+cp LICENSE "$APP/Contents/Resources/LICENSE.txt"
+cp Docs/PRIVACY.md "$APP/Contents/Resources/Privacy.txt"
 
 echo "==> signing ($([ "$SIGN_IDENTITY" = "-" ] && echo "ad-hoc" || echo "$SIGN_IDENTITY"))"
 SIGN_ARGS=(--force --options runtime --entitlements "$ENTITLEMENTS" -s "$SIGN_IDENTITY")
@@ -57,5 +78,16 @@ codesign "${SIGN_ARGS[@]}" "$APP"
 
 echo "==> verify"
 "$ROOT/Scripts/verify-release.sh" "$APP"
+if [ "$SIGN_IDENTITY" != "-" ]; then
+    "$ROOT/Scripts/verify-release.sh" "$APP" --signed
+fi
 
+echo "==> smoke (read only)"
+"$APP/Contents/MacOS/$APP_NAME" --smoke
+{
+    printf 'Still %s (%s) %s\n' "$VERSION" "$BUILD" "$RELEASE_CHANNEL"
+    xcodebuild -version
+    swift --version
+    shasum -a 256 "$APP/Contents/MacOS/$APP_NAME"
+} > "$DIST/build-record.txt"
 echo "==> done: $APP"

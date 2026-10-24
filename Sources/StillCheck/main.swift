@@ -1,5 +1,22 @@
 import Foundation
+import IOKit.pwr_mgt
 import StillKit
+
+// Disposable owner used only by Scripts/test-power-crash.py. No AppModel,
+// preferences, privileged commands, or installed Still instance are involved.
+if CommandLine.arguments.contains("--power-assertion-probe") {
+    let reason = "StillCrashSafetyProbe-\(UUID().uuidString)"
+    var id: IOPMAssertionID = 0
+    let result = IOPMAssertionCreateWithDescription(
+        kIOPMAssertionTypePreventUserIdleSystemSleep as CFString, reason as CFString,
+        nil, nil, nil, 20, kIOPMAssertionTimeoutActionRelease as CFString, &id)
+    guard result == kIOReturnSuccess else { exit(2) }
+    print(reason)
+    fflush(nil)
+    Thread.sleep(forTimeInterval: 20)
+    IOPMAssertionRelease(id)
+    exit(0)
+}
 
 var passed = 0
 var failed = 0
@@ -165,10 +182,10 @@ do {
     expect(ReconcileLogic.launchAction(flag: true, didSetFlag: false, privileged: false), .warnNoPrivilege, "external flag without privilege warns")
     expect(ReconcileLogic.launchAction(flag: false, didSetFlag: true, privileged: true), .clearOwnership, "stale ownership cleared")
     expect(ReconcileLogic.launchAction(flag: false, didSetFlag: false, privileged: true), .none, "clean launch does nothing")
-    expect(ReconcileLogic.launchAction(flag: nil, didSetFlag: true, privileged: true), .clearOwnership, "unreadable flag clears ownership")
+    expect(ReconcileLogic.launchAction(flag: nil, didSetFlag: true, privileged: true), .clearFlag, "unreadable owned flag keeps recovery responsibility")
     expect(ReconcileLogic.launchAction(flag: nil, didSetFlag: false, privileged: true), .none, "unreadable clean does nothing")
 
-    expect(ReconcileLogic.tickAction(flag: false, holdDesired: true, didSetFlag: true, privileged: true), .setFlag(true), "tick re-asserts lost flag")
+    check(ReconcileLogic.tickAction(flag: false, holdDesired: true, didSetFlag: true, privileged: true) == nil, "tick never re-enables global sleep disable")
     expect(ReconcileLogic.tickAction(flag: true, holdDesired: false, didSetFlag: true, privileged: true), .setFlag(false), "tick releases owned flag")
     check(ReconcileLogic.tickAction(flag: true, holdDesired: true, didSetFlag: true, privileged: true) == nil, "tick leaves matching hold")
     check(ReconcileLogic.tickAction(flag: false, holdDesired: false, didSetFlag: false, privileged: true) == nil, "tick leaves matching release")
@@ -198,11 +215,11 @@ do {
 
 do {
     expect(
-        SudoersRule.line(username: "alice"),
-        "alice ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0",
+        SudoersRule.line(userID: 501),
+        "#501 ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset -a disablesleep 0",
         "rule format"
     )
-    check(SudoersRule.validate(rule: SudoersRule.line(username: CurrentUser.shortName)), "valid rule passes visudo")
+    check(SudoersRule.validate(rule: SudoersRule.line(userID: getuid())), "valid rule passes visudo")
     check(!SudoersRule.validate(rule: "this is not a sudoers rule at all !!!"), "garbage rule fails visudo")
     let filename = SudoersRule.installPath.split(separator: "/").last.map(String.init)
     expect(filename, Brand.sudoersFileName, "install path filename")

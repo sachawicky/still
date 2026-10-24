@@ -34,6 +34,8 @@ public struct StatusSummary: Equatable, Sendable {
             case .lowPower: reason = "Low Power Mode is on."
             case .setup: reason = "One-time setup is needed."
             case .error: reason = "Sleep settings couldn’t be changed. Retrying."
+            case .system: reason = "Released for sleep or screen lock. Start a new session to resume."
+            case .externalDisplay: reason = "External display connected. macOS manages sleep."
             }
             return StatusSummary(tone: .paused, title: "Paused", reason: reason, remaining: nil)
         case .active:

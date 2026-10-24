@@ -28,6 +28,7 @@ public struct DetectionSnapshot: Sendable, Equatable {
     public var lowPowerMode: Bool
     public var lidClosed: Bool
     public var agent: CodingAgent?
+    public var externalDisplayConnected: Bool
 
     public var streamActive: Bool { !targets.isEmpty }
     public var agentActive: Bool { agent != nil }
@@ -39,7 +40,8 @@ public struct DetectionSnapshot: Sendable, Equatable {
         thermalNominalOrFair: Bool = true,
         lowPowerMode: Bool = false,
         lidClosed: Bool = false,
-        agent: CodingAgent? = nil
+        agent: CodingAgent? = nil,
+        externalDisplayConnected: Bool = false
     ) {
         self.targets = targets
         self.batteryPercent = batteryPercent
@@ -48,7 +50,13 @@ public struct DetectionSnapshot: Sendable, Equatable {
         self.lowPowerMode = lowPowerMode
         self.lidClosed = lidClosed
         self.agent = agent
+        self.externalDisplayConnected = externalDisplayConnected
     }
+}
+
+private let displayCallback: CGDisplayReconfigurationCallBack = { _, _, context in
+    guard let context else { return }
+    Unmanaged<CallbackBox>.fromOpaque(context).takeUnretainedValue().handler()
 }
 
 private final class CallbackBox {
@@ -66,7 +74,7 @@ public final class DetectionCenter {
     private var powerSource: CFRunLoopSource?
     private var displayBox: CallbackBox?
     private var displayRegistered = false
-    private var audioBlocks: [(AudioObjectID, AudioObjectPropertyListenerBlock)] = []
+    private var audioBlocks: [(AudioObjectID, AudioObjectPropertyAddress, AudioObjectPropertyListenerBlock)] = []
     private var observers: [NSObjectProtocol] = []
     private var pollTimer: Timer?
     private let agents = AgentWatcher()
@@ -80,6 +88,19 @@ public final class DetectionCenter {
         setUpPollTimer()
     }
 
+    isolated deinit {
+        pollTimer?.invalidate()
+        if let powerSource { CFRunLoopRemoveSource(CFRunLoopGetMain(), powerSource, .commonModes) }
+        if displayRegistered, let displayBox {
+            CGDisplayRemoveReconfigurationCallback(displayCallback, Unmanaged.passUnretained(displayBox).toOpaque())
+        }
+        for (id, storedAddress, block) in audioBlocks {
+            var address = storedAddress
+            AudioObjectRemovePropertyListenerBlock(id, &address, DispatchQueue.main, block)
+        }
+        for observer in observers { NotificationCenter.default.removeObserver(observer) }
+    }
+
     public func snapshot() -> DetectionSnapshot {
         DetectionSnapshot(
             targets: streamTargets(),
@@ -89,13 +110,24 @@ public final class DetectionCenter {
                 || ProcessInfo.processInfo.thermalState == .fair,
             lowPowerMode: ProcessInfo.processInfo.isLowPowerModeEnabled,
             lidClosed: lidClosed() ?? false,
-            agent: agents.workingAgent()
+            agent: agents.workingAgent(),
+            externalDisplayConnected: Self.hasExternalDisplay()
         )
     }
 
     /// Cheap enough to sample every couple of seconds while a stream is held.
     public func lidIsClosed() -> Bool { lidClosed() ?? false }
     public func browserPlaybackActive() -> Bool { WebKitAudioProbe.isPlaying() }
+
+    /// Online includes connected displays that are asleep or mirrored.
+    /// Fail safely if enumeration is unavailable: Still must not take over.
+    public static func hasExternalDisplay() -> Bool {
+        var count: UInt32 = 0
+        guard CGGetOnlineDisplayList(0, nil, &count) == .success else { return true }
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetOnlineDisplayList(count, &displays, &count) == .success else { return true }
+        return displays.prefix(Int(count)).contains { CGDisplayIsBuiltin($0) == 0 }
+    }
 
     public func notify() {
         DispatchQueue.main.async { [weak self] in
@@ -209,7 +241,7 @@ public final class DetectionCenter {
 
     private func onBattery() -> Bool {
         guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
-              let sourceType = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else { return false }
+              let sourceType = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else { return true }
         return (sourceType as String) == (kIOPSBatteryPowerValue as String)
     }
 
@@ -241,14 +273,7 @@ public final class DetectionCenter {
             DispatchQueue.main.async { self?.onChange?() }
         }
         displayBox = box
-        let status = CGDisplayRegisterReconfigurationCallback(
-            { _, _, context in
-                guard let context else { return }
-                let box = Unmanaged<CallbackBox>.fromOpaque(context).takeUnretainedValue()
-                box.handler()
-            },
-            Unmanaged.passUnretained(box).toOpaque()
-        )
+        let status = CGDisplayRegisterReconfigurationCallback(displayCallback, Unmanaged.passUnretained(box).toOpaque())
         displayRegistered = status == .success
     }
 
@@ -264,7 +289,7 @@ public final class DetectionCenter {
         )
         if AudioObjectHasProperty(output.id, &address) {
             if AudioObjectAddPropertyListenerBlock(output.id, &address, DispatchQueue.main, block) == noErr {
-                audioBlocks.append((output.id, block))
+                audioBlocks.append((output.id, address, block))
             }
         }
         var defaultAddress = AudioObjectPropertyAddress(
@@ -278,7 +303,7 @@ public final class DetectionCenter {
             DispatchQueue.main,
             block
         ) == noErr {
-            audioBlocks.append((AudioObjectID(kAudioObjectSystemObject), block))
+            audioBlocks.append((AudioObjectID(kAudioObjectSystemObject), defaultAddress, block))
         }
     }
 

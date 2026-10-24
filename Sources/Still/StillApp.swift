@@ -10,10 +10,13 @@ struct StillApp: App {
     @StateObject private var model: AppModel
 
     init() {
-        UserDefaults.standard.register(defaults: [
-            "autoDetectEnabled": true,
-            "batteryFloor": 15
-        ])
+        FocusInbox.runHookIfRequested()
+        if CommandLine.arguments.contains("--enable-native-agent-notifications") {
+            FocusController.enableNativeNotificationsAndExit()
+        }
+        if CommandLine.arguments.contains("--notification-diagnostics") {
+            FocusController.runNotificationDiagnosticsAndExit()
+        }
         if CommandLine.arguments.contains("--smoke") {
             AppModel.runSmokeAndExit()
         }
@@ -27,6 +30,7 @@ struct StillApp: App {
                 exit(1)
             }
         }
+        PreferenceMigration.migrate(.standard)
         // One instance only: a second launch must not create a second menu-bar
         // item or a second power controller.
         if let id = Bundle.main.bundleIdentifier {
@@ -42,6 +46,7 @@ struct StillApp: App {
         MenuBarExtra {
             PopoverView()
                 .environmentObject(model)
+                .environmentObject(model.appearance)
         } label: {
             MenuBarLabel()
                 .environmentObject(model)

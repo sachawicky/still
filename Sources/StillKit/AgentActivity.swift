@@ -109,6 +109,8 @@ public final class AgentWatcher {
         if touched { onChange?() }
     }
 
+    isolated deinit { stop() }
+
     private func stop() {
         guard let stream else { return }
         FSEventStreamStop(stream)

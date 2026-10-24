@@ -22,6 +22,7 @@ let package = Package(
             dependencies: ["StillKit"],
             path: "Sources/Still"
         ),
+        .testTarget(name: "StillKitTests", dependencies: ["StillKit"]),
         .executableTarget(
             name: "StillCheck",
             dependencies: ["StillKit"],
